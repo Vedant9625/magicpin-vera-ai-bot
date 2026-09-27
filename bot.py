@@ -40,13 +40,11 @@ conversations: dict[str, list] = {}
 sent_suppression: dict[str, set] = {}
 conv_meta: dict[str, dict] = {}
 
-
 def reset_state():
     contexts.clear()
     conversations.clear()
     sent_suppression.clear()
     conv_meta.clear()
-
 
 # ---------------------------------------------------------
 # STATIC KNOWLEDGE & SAFEGUARDS
@@ -68,8 +66,6 @@ POSITIVE_INTENT = ["ok lets do it", "let's do it", "whats next", "yes please", "
 WAIT_PHRASES = ["not now", "busy", "call later", "call me later", "remind me", "abhi nahi",
                 "baad mein", "thodi der baad", "kal baat karte", "busy hoon"]
 
-# Decision-quality: relative weight per trigger kind, used to pick the single best
-# signal when several fire for the same merchant in one tick.
 KIND_WEIGHT = {
     "perf_dip": 9, "customer_lapsed_soft": 8, "recall_due": 8, "competitor_opened": 7,
     "review_theme_emerged": 6, "milestone_reached": 6, "appointment_tomorrow": 6,
@@ -83,9 +79,6 @@ CONSENT_SCOPE_FOR_KIND = {
     "appointment_tomorrow": "appointment_reminders",
 }
 
-# Which compulsion lever fits each trigger kind. Kept separate from performance
-# framing so a positive event (milestone, spike) never gets forced into a
-# "name the drop" loss-aversion frame it doesn't fit.
 LEVER_BY_KIND = {
     "perf_dip": "Loss aversion: name the exact drop, offer the fix.",
     "customer_lapsed_soft": "Loss aversion: a specific customer cohort is slipping away, offer the fix.",
@@ -106,31 +99,23 @@ LEVER_BY_KIND = {
 }
 PERFORMANCE_DRIVEN_KINDS = {"perf_dip", "perf_spike", "customer_lapsed_soft", "dormant_with_vera"}
 
-TICK_DEADLINE_SECONDS = 25.0   # stay under the judge's 30s /v1/tick timeout
-REPLY_DEADLINE_SECONDS = 20.0  # stay under the judge's 30s /v1/reply timeout
+TICK_DEADLINE_SECONDS = 25.0   
+REPLY_DEADLINE_SECONDS = 20.0  
 MAX_CONCURRENT_LLM_CALLS = 3
 MIN_INTERVAL_SECONDS = float(os.environ.get("GEMINI_MIN_INTERVAL_SECONDS", "1.2"))
 MAX_RETRIES = 3
 
-
-# ---------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------
 def norm(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().lower())
-
 
 def similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, norm(a), norm(b)).ratio()
 
-
 def word_match(phrase: str, text: str) -> bool:
     return re.search(r"\b" + re.escape(phrase) + r"\b", text) is not None
 
-
 def any_word_match(phrases: list[str], text: str) -> bool:
     return any(word_match(p, text) for p in phrases)
-
 
 def is_auto_reply(message: str, history: list[dict], from_role: str) -> bool:
     m = norm(message)
@@ -139,14 +124,12 @@ def is_auto_reply(message: str, history: list[dict], from_role: str) -> bool:
     prior_same_role = [norm(h["text"]) for h in history if h.get("role") == from_role]
     return any(similarity(p, m) > 0.92 for p in prior_same_role)
 
-
 def language_mode(languages: Optional[list], language_pref: Optional[str] = None) -> str:
     if language_pref and "hi" in str(language_pref).lower():
         return "hi-en"
     if languages and "hi" in [str(l).lower() for l in languages]:
         return "hi-en"
     return "en"
-
 
 def is_expired(trg: dict, now_iso: Optional[str]) -> bool:
     exp = trg.get("expires_at")
@@ -159,7 +142,6 @@ def is_expired(trg: dict, now_iso: Optional[str]) -> bool:
     except Exception:
         return False
 
-
 def consent_ok(customer: Optional[dict], trigger_kind: str) -> bool:
     needed = CONSENT_SCOPE_FOR_KIND.get(trigger_kind)
     if not needed:
@@ -169,31 +151,20 @@ def consent_ok(customer: Optional[dict], trigger_kind: str) -> bool:
     scope = (customer.get("consent") or {}).get("scope", [])
     return needed in scope
 
-
 def score_trigger(trg: dict) -> float:
     return trg.get("urgency", 1) * 10 + KIND_WEIGHT.get(trg.get("kind", ""), 3)
-
 
 def too_similar_to_history(conversation_id: str, body_text: str) -> bool:
     prev = conv_meta.get(conversation_id, {}).get("sent_bodies", [])
     return any(similarity(p, body_text) > 0.85 for p in prev if body_text)
 
-
 def _record_sent(conversation_id: str, body_text: str):
     meta = conv_meta.setdefault(conversation_id, {"sent_bodies": []})
     meta["sent_bodies"].append(body_text)
 
-
 # ---------------------------------------------------------
 # ASYNC-SAFE, DEADLINE-AWARE LLM CALLER
 # ---------------------------------------------------------
-# Blocking network calls must never run directly inside an `async def` endpoint —
-# doing so freezes the whole event loop, including the /v1/healthz polls the judge
-# uses to decide whether to disqualify the bot. Every call is offloaded to a worker
-# thread via asyncio.to_thread, paced by an asyncio-native gate (no time.sleep on
-# the event loop), and bounded by a wall-clock deadline so a slow/rate-limited call
-# degrades to the fallback instead of blowing the judge's 30s per-call timeout.
-
 class RateGate:
     def __init__(self, min_interval: float, max_concurrent: int):
         self.min_interval = min_interval
@@ -209,9 +180,7 @@ class RateGate:
                 await asyncio.sleep(wait)
             self._last = time.monotonic()
 
-
 gate = RateGate(MIN_INTERVAL_SECONDS, MAX_CONCURRENT_LLM_CALLS)
-
 
 async def call_gemini_async(system_instructions: str, prompt_text: str, deadline: float) -> dict:
     last_exc: Optional[Exception] = None
@@ -221,7 +190,6 @@ async def call_gemini_async(system_instructions: str, prompt_text: str, deadline
         async with gate._sem:
             await gate.wait_turn()
             try:
-                # Using the native async client (client.aio) instead of threads
                 response = await client.aio.models.generate_content(
                     model=MODEL,
                     contents=prompt_text,
@@ -231,58 +199,29 @@ async def call_gemini_async(system_instructions: str, prompt_text: str, deadline
                         response_mime_type="application/json",
                     ),
                 )
-                
-                # Bulletproof JSON parsing to prevent DecodeErrors
                 raw_text = response.text.strip()
                 if raw_text.startswith("```json"):
                     raw_text = raw_text[7:]
                 if raw_text.endswith("```"):
                     raw_text = raw_text[:-3]
-                    
                 return json.loads(raw_text.strip())
-                
             except Exception as e:
                 last_exc = e
-                # Retry on ANY error so transient SDK drops don't instantly trigger the fallback
+                # Retrying on ANY error directly prevents instant fallbacks
                 remaining = deadline - time.monotonic()
                 backoff = min((2 ** attempt) + random.uniform(0, 0.4), max(0.0, remaining - 0.3))
                 if backoff > 0:
                     await asyncio.sleep(backoff)
                 continue
-                
     raise last_exc if last_exc else RuntimeError("LLM call failed with no exception captured")
-
-
-async def call_gemini_async(system_instructions: str, prompt_text: str, deadline: float) -> dict:
-    last_exc: Optional[Exception] = None
-    for attempt in range(MAX_RETRIES):
-        if time.monotonic() >= deadline - 0.3:
-            raise TimeoutError("time budget exhausted before call")
-        async with gate._sem:
-            await gate.wait_turn()
-            try:
-                return await asyncio.to_thread(_sync_generate, system_instructions, prompt_text)
-            except Exception as e:
-                last_exc = e
-                is_rate_limited = "429" in str(e) or "Too Many Requests" in str(e) or "RESOURCE_EXHAUSTED" in str(e)
-                if is_rate_limited:
-                    remaining = deadline - time.monotonic()
-                    backoff = min((2 ** attempt) + random.uniform(0, 0.4), max(0.0, remaining - 0.3))
-                    if backoff > 0:
-                        await asyncio.sleep(backoff)
-                    continue
-                break
-    raise last_exc if last_exc else RuntimeError("LLM call failed with no exception captured")
-
 
 def build_fallback(prompt_data: dict, rationale: str) -> dict:
     target = prompt_data.get("target") or prompt_data.get("customer_name") or "there"
     body = f"Hi {target}, checking in on your profile. Want to review your active offers? Reply 1."
     return {"body": body, "cta": "Reply 1 to confirm.", "rationale": rationale}
 
-
 # ---------------------------------------------------------
-# ENDPOINTS — health, metadata, context
+# ENDPOINTS
 # ---------------------------------------------------------
 @app.get("/v1/healthz")
 async def healthz():
@@ -291,18 +230,14 @@ async def healthz():
         counts[scope] = counts.get(scope, 0) + 1
     return {"status": "ok", "uptime_seconds": int(time.time() - START), "contexts_loaded": counts}
 
-
 @app.get("/v1/metadata")
 async def metadata():
     return {
         "team_name": "Solo Dev", "team_members": ["Vedant"], "model": MODEL,
-        "approach": ("V7: score-ranked trigger selection with a per-tick time budget, "
-                     "peer-benchmark specificity, kind-matched compulsion levers, "
-                     "consent-gated customer messaging, and non-blocking async LLM calls."),
-        "contact_email": "vedant@example.com", "version": "7.0.0",
+        "approach": "V7 Master: Client.aio async execution, fallback elimination, strict psychological levers.",
+        "contact_email": "vedant@example.com", "version": "7.1.0",
         "submitted_at": datetime.utcnow().isoformat() + "Z",
     }
-
 
 class CtxBody(BaseModel):
     scope: str
@@ -310,7 +245,6 @@ class CtxBody(BaseModel):
     version: int
     payload: dict[str, Any]
     delivered_at: str
-
 
 @app.post("/v1/context")
 async def push_context(body: CtxBody):
@@ -324,12 +258,10 @@ async def push_context(body: CtxBody):
     return {"accepted": True, "ack_id": f"ack_{body.context_id}_v{body.version}",
             "stored_at": datetime.utcnow().isoformat() + "Z"}
 
-
 @app.post("/v1/teardown")
 async def teardown():
     reset_state()
     return {"status": "teardown_complete"}
-
 
 # ---------------------------------------------------------
 # DYNAMIC COMPOSER
@@ -365,7 +297,6 @@ def build_prompt(merchant: dict, category: dict, trg: dict, customer: Optional[d
     }
 
     if scope == "customer" and customer:
-        # CUSTOMER-FACING ROUTING (recall, appointment, lapsed)
         lang = language_mode(None, customer.get("identity", {}).get("language_pref"))
         slots = customer.get("preferences", {}).get("preferred_slots", "any time")
         prompt_data["customer_name"] = customer.get("identity", {}).get("name")
@@ -385,7 +316,6 @@ def build_prompt(merchant: dict, category: dict, trg: dict, customer: Optional[d
         )
         return prompt_data, system_instructions, f"Context Data:\n{json.dumps(prompt_data, indent=2, default=str)}\nDraft the message."
 
-    # MERCHANT-FACING ROUTING (dynamic by trigger kind)
     lang = language_mode(merchant.get("identity", {}).get("languages"))
     lever = LEVER_BY_KIND.get(trigger_kind, "Value and effort externalization: I already did the work, one-tap approve.")
 
@@ -427,11 +357,9 @@ def build_prompt(merchant: dict, category: dict, trg: dict, customer: Optional[d
     )
     return prompt_data, system_instructions, f"Context Data:\n{json.dumps(prompt_data, indent=2, default=str)}\nDraft the message."
 
-
 class TickBody(BaseModel):
     now: str
     available_triggers: list[str] = []
-
 
 @app.post("/v1/tick")
 async def tick(body: TickBody):
@@ -456,9 +384,6 @@ async def tick(body: TickBody):
         else:
             by_merchant.setdefault(merchant_id, []).append((trg_id, trg))
 
-    # Build a single priority queue across BOTH merchant- and customer-facing
-    # candidates so that if the tick runs short on time, the highest-value
-    # signals (by urgency + kind weight) are the ones that actually get sent.
     jobs = []
     for merchant_id, candidates in by_merchant.items():
         merchant = contexts.get(("merchant", merchant_id), {}).get("payload")
@@ -536,10 +461,6 @@ async def tick(body: TickBody):
 
     return {"actions": actions[:20]}
 
-
-# ---------------------------------------------------------
-# MULTI-TURN REPLY (REPLAY TEST DEFENSES)
-# ---------------------------------------------------------
 class ReplyBody(BaseModel):
     conversation_id: str
     merchant_id: Optional[str] = None
@@ -548,7 +469,6 @@ class ReplyBody(BaseModel):
     message: str
     received_at: str
     turn_number: int
-
 
 @app.post("/v1/reply")
 async def reply(body: ReplyBody):
@@ -560,11 +480,9 @@ async def reply(body: ReplyBody):
     merchant = contexts.get(("merchant", body.merchant_id), {}).get("payload") if body.merchant_id else None
     lang = language_mode(merchant.get("identity", {}).get("languages")) if merchant else "en"
 
-    # Rule 1: explicit stop / opt-out
     if any_word_match(STOP_WORDS, msg_norm):
         return {"action": "end", "rationale": "Merchant opted out. Exiting."}
 
-    # Rule 2: auto-reply / canned-loop detection — one graceful re-ask, then exit
     if is_auto_reply(body.message, history_before, body.from_role):
         vera_nudges = sum(1 for h in history_before if h.get("role") == "vera")
         if vera_nudges >= 1:
@@ -576,11 +494,9 @@ async def reply(body: ReplyBody):
         return {"action": "send", "body": nudge, "cta": "Reply YES",
                 "rationale": "First canned auto-reply detected; one graceful re-ask before exiting on repeat."}
 
-    # Rule 3: explicit "not now" / back-off signal
     if any_word_match(WAIT_PHRASES, msg_norm):
         return {"action": "wait", "wait_seconds": 1800, "rationale": "Merchant asked for time; backing off 30 min."}
 
-    # Rule 4: explicit positive intent -> immediate handoff, no re-qualification
     if any_word_match(POSITIVE_INTENT, msg_norm):
         body_text = ("Done — maine yeh abhi activate kar diya hai aapke profile pe, ab main numbers track karke update karti rahungi."
                      if lang == "hi-en" else
@@ -589,7 +505,6 @@ async def reply(body: ReplyBody):
         return {"action": "send", "body": body_text, "cta": "none",
                 "rationale": "Explicit positive intent detected. Instantly transitioning to action without further qualification."}
 
-    # Rule 5: dynamic conversation via LLM — handles direct questions, hostility, off-topic redirects
     system_instructions = (
         "You are Vera, magicpin's merchant assistant, continuing an existing WhatsApp conversation.\n"
         "RULES:\n"
