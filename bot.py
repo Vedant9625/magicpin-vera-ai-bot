@@ -213,17 +213,44 @@ class RateGate:
 gate = RateGate(MIN_INTERVAL_SECONDS, MAX_CONCURRENT_LLM_CALLS)
 
 
-def _sync_generate(system_instructions: str, prompt_text: str) -> dict:
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=prompt_text,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instructions,
-            temperature=0.0,
-            response_mime_type="application/json",
-        ),
-    )
-    return json.loads(response.text)
+async def call_gemini_async(system_instructions: str, prompt_text: str, deadline: float) -> dict:
+    last_exc: Optional[Exception] = None
+    for attempt in range(MAX_RETRIES):
+        if time.monotonic() >= deadline - 0.3:
+            raise TimeoutError("time budget exhausted before call")
+        async with gate._sem:
+            await gate.wait_turn()
+            try:
+                # Using the native async client (client.aio) instead of threads
+                response = await client.aio.models.generate_content(
+                    model=MODEL,
+                    contents=prompt_text,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instructions,
+                        temperature=0.0,
+                        response_mime_type="application/json",
+                    ),
+                )
+                
+                # Bulletproof JSON parsing to prevent DecodeErrors
+                raw_text = response.text.strip()
+                if raw_text.startswith("```json"):
+                    raw_text = raw_text[7:]
+                if raw_text.endswith("```"):
+                    raw_text = raw_text[:-3]
+                    
+                return json.loads(raw_text.strip())
+                
+            except Exception as e:
+                last_exc = e
+                # Retry on ANY error so transient SDK drops don't instantly trigger the fallback
+                remaining = deadline - time.monotonic()
+                backoff = min((2 ** attempt) + random.uniform(0, 0.4), max(0.0, remaining - 0.3))
+                if backoff > 0:
+                    await asyncio.sleep(backoff)
+                continue
+                
+    raise last_exc if last_exc else RuntimeError("LLM call failed with no exception captured")
 
 
 async def call_gemini_async(system_instructions: str, prompt_text: str, deadline: float) -> dict:
